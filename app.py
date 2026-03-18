@@ -1,499 +1,443 @@
-
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from functools import wraps
-import jwt
-import bcrypt
-from datetime import datetime, timedelta
-from supabase import create_client
 import os
-from dotenv import load_dotenv
 import logging
+from datetime import datetime, timedelta
+from functools import wraps
+from dotenv import load_dotenv
+
+from flask import Flask, request, jsonify, redirect, session
+from flask_cors import CORS
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import yt_dlp
+from cachetools import TTLCache
+import user_agents
+import redis
+from celery import Celery
+import json
 
 # Charger les variables d'environnement
-load_dotenv(dotenv_path="ex.env")
+load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # autorise toutes les origines
+app.secret_key = os.getenv('SECRET_KEY', 'dev-key-change-en-prod')
 
-# Configuration
-JWT_SECRET = os.getenv('JWT_SECRET', 'hospital_jwt_secret_2024')
-JWT_EXPIRES_HOURS = 168  # 7 jours
+# 🔐 Configuration Redis
+redis_client = redis.Redis.from_url(
+    os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    decode_responses=True
+)
 
-# Supabase
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+# ⚡ Configuration Celery
+celery = Celery(
+    app.name,
+    broker=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    backend=os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+)
 
-# Admin initial
-ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@hospital.com')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'Admin123!')
-ADMIN_NAME = os.getenv('ADMIN_NAME', 'Administrateur Principal')
+# 🔐 CORS ultra sécurisé
+ALLOWED_ORIGINS = [
+    'https://tikt0k-64.web.app',
+    'http://localhost:3000'  # pour le dev
+]
+CORS(app, origins=ALLOWED_ORIGINS)
 
-# Initialiser Supabase
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+# 📊 Rate limiting avec Redis
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    storage_uri=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    default_limits=["30 per minute"]
+)
 
-# Configuration du logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# 🌍 Sites autorisés
+ALLOWED_SITES = [
+    'youtube.com', 'youtu.be',
+    'tiktok.com',
+    'facebook.com', 'fb.watch',
+    'instagram.com',
+    'twitter.com', 'x.com'
+]
 
-# =====================================================
-# UTILITAIRES
-# =====================================================
+# 🔑 API Keys (pour monétisation)
+API_KEYS = {
+    'free': {'rate': '10 per minute', 'price': 0},
+    'premium': {'rate': '100 per minute', 'price': 9.99},
+    'pro': {'rate': 'unlimited', 'price': 29.99}
+}
+VALID_API_KEYS = {
+    'free_123': 'free',
+    'premium_456': 'premium',
+    'pro_789': 'pro'
+}
 
-def hash_password(password):
-    """Hasher un mot de passe"""
-    try:
-        salt = bcrypt.gensalt()
-        hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-        return hashed.decode('utf-8')
-    except Exception as e:
-        logger.error(f"Erreur hash_password: {e}")
-        raise
+# 📈 Statistiques
+def increment_stat(stat_name):
+    """Incrémente un compteur Redis"""
+    today = datetime.now().strftime('%Y-%m-%d')
+    redis_client.incr(f"stat:{stat_name}:{today}")
+    redis_client.expire(f"stat:{stat_name}:{today}", 86400 * 30)  # 30 jours
 
-def check_password(password, hashed):
-    """Vérifier un mot de passe hashé"""
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-    except Exception as e:
-        logger.error(f"Erreur check_password: {e}")
-        return False
-
-def generate_token(user_data):
-    """Générer un token JWT"""
-    try:
-        payload = {
-            'user_id': user_data['id'],
-            'email': user_data['email'],
-            'role': user_data['role'],
-            'exp': datetime.utcnow() + timedelta(hours=JWT_EXPIRES_HOURS)
+def get_stats(days=7):
+    """Récupère les stats des derniers jours"""
+    stats = {}
+    for i in range(days):
+        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+        stats[date] = {
+            'downloads': int(redis_client.get(f"stat:downloads:{date}") or 0),
+            'info': int(redis_client.get(f"stat:info:{date}") or 0),
+            'errors': int(redis_client.get(f"stat:errors:{date}") or 0),
+            'unique_ips': redis_client.scard(f"stat:ips:{date}") or 0
         }
-        return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
-    except Exception as e:
-        logger.error(f"Erreur generate_token: {e}")
-        raise
+    return stats
 
-def verify_token(token):
-    """Vérifier un token JWT"""
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        return payload
-    except jwt.ExpiredSignatureError:
-        logger.warning("Token expiré")
-        return None
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Token invalide: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Erreur verify_token: {e}")
-        return None
-
-def token_required(f):
-    """Décorateur pour vérifier le token JWT"""
+# 🔐 Middleware API Key
+def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
+        api_key = request.headers.get('X-API-Key')
         
-        # Vérifier dans les headers
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            if auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
+        if not api_key:
+            return jsonify({'error': 'API key required'}), 401
         
-        if not token:
-            return jsonify({'message': 'Token manquant'}), 401
+        if api_key not in VALID_API_KEYS:
+            return jsonify({'error': 'Invalid API key'}), 401
         
-        # Vérifier le token
-        payload = verify_token(token)
-        if not payload:
-            return jsonify({'message': 'Token invalide ou expiré'}), 401
+        plan = VALID_API_KEYS[api_key]
+        kwargs['plan'] = plan
         
-        # Ajouter les infos utilisateur à la requête
-        request.user = payload
+        # Rate limit personnalisé
+        if plan != 'pro':
+            limiter.limit(API_KEYS[plan]['rate'])(f)
         
         return f(*args, **kwargs)
     return decorated
 
-def admin_required(f):
-    """Décorateur pour vérifier les droits admin"""
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not hasattr(request, 'user') or request.user.get('role') != 'admin':
-            return jsonify({'message': 'Accès refusé. Admin requis.'}), 403
-        return f(*args, **kwargs)
-    return decorated
+# 🔄 Proxy rotation (pour éviter les blocages)
+PROXIES = [
+    'http://proxy1:port',
+    'http://proxy2:port',
+    # À configurer avec un service comme ProxyCrawl ou ScraperAPI
+]
 
-# =====================================================
-# INITIALISATION DE LA BASE DE DONNÉES
-# =====================================================
+def get_proxy():
+    """Retourne un proxy aléatoire"""
+    if PROXIES:
+        import random
+        return random.choice(PROXIES)
+    return None
 
-def init_database():
-    """Vérifier la connexion et créer l'admin si nécessaire"""
+# 📱 Détection device
+def detect_device(user_agent_string):
+    ua = user_agents.parse(user_agent_string)
+    
+    # Enregistrer l'IP unique pour les stats
+    redis_client.sadd(f"stat:ips:{datetime.now().strftime('%Y-%m-%d')}", request.remote_addr)
+    
+    if ua.is_mobile:
+        return {'type': 'mobile', 'max_height': 480, 'emoji': '📱'}
+    elif ua.is_tablet:
+        return {'type': 'tablet', 'max_height': 720, 'emoji': '📟'}
+    else:
+        return {'type': 'desktop', 'max_height': 1080, 'emoji': '💻'}
+
+# 🎯 Tâche Celery pour téléchargement asynchrone
+@celery.task(bind=True, max_retries=3)
+def download_task(self, url, format_id):
+    """Téléchargement en arrière-plan"""
     try:
-        logger.info("Vérification de la connexion Supabase...")
-        
-        # Test de connexion simple
-        response = supabase.from_('users').select('id').limit(1).execute()
-        logger.info(f"Connexion Supabase réussie. Structure réponse: {type(response)}")
-        
-        # Vérifier si l'admin existe
-        response = supabase.from_('users').select('*').eq('email', ADMIN_EMAIL).execute()
-        
-        # Accéder aux données correctement
-        if response.data and len(response.data) > 0:
-            logger.info("Compte admin déjà existant")
-        else:
-            logger.info("Création du compte admin...")
-            admin_data = {
-                'email': ADMIN_EMAIL,
-                'nom': ADMIN_NAME,
-                'password_hash': hash_password(ADMIN_PASSWORD),
-                'role': 'admin'
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': format_id if format_id != 'audio' else 'bestaudio',
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
+        }
+        
+        if format_id == 'audio':
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+            }]
+        
+        # Ajouter un proxy si disponible
+        proxy = get_proxy()
+        if proxy:
+            ydl_opts['proxy'] = proxy
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
             
-            insert_response = supabase.from_('users').insert(admin_data).execute()
-            
-            if insert_response.data:
-                logger.info("Compte admin créé avec succès")
+            # Trouver l'URL directe
+            if format_id == 'audio':
+                for f in info['formats']:
+                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                        return {'url': f['url'], 'format': 'audio'}
             else:
-                logger.error("Échec création compte admin")
-                return False
+                for f in info['formats']:
+                    if f.get('format_id') == format_id:
+                        return {'url': f['url'], 'format': 'video'}
         
-        logger.info("Base de données initialisée avec succès")
-        return True
+        return {'error': 'Format not found'}
         
     except Exception as e:
-        logger.error(f"ERREUR initialisation base de données: {str(e)}")
-        logger.error("Assurez-vous que:")
-        logger.error(f"1. SUPABASE_URL est correct: {SUPABASE_URL}")
-        logger.error(f"2. SUPABASE_KEY est correct: {SUPABASE_KEY[:20]}...")
-        logger.error("3. Les tables 'users' et 'patients' existent dans Supabase")
-        logger.error("4. La clé API a les permissions nécessaires")
-        return False
+        self.retry(exc=e, countdown=60)  # Réessayer après 60s
 
-# =====================================================
-# ROUTES D'AUTHENTIFICATION
-# =====================================================
-
-@app.route('/api/auth/register', methods=['POST'])
-def register():
-    """Enregistrer un nouvel utilisateur"""
+# 📥 INFO (avec cache Redis)
+@app.route('/info', methods=['POST'])
+@limiter.limit("30 per minute")
+@require_api_key
+def get_info(plan):
+    data = request.get_json()
+    url = data.get('url')
+    
+    increment_stat('info')
+    
+    if not url:
+        return jsonify({'error': 'URL manquante'}), 400
+    
+    # 🔐 Sécurité URL
+    if not any(site in url for site in ALLOWED_SITES):
+        increment_stat('errors')
+        return jsonify({'error': 'Site non supporté'}), 400
+    
+    # Cache Redis
+    cache_key = f"info:{url}"
+    cached = redis_client.get(cache_key)
+    if cached:
+        return jsonify(json.loads(cached))
+    
     try:
-        # Vérifier le contenu JSON
-        if not request.is_json:
-            return jsonify({'message': 'Content-Type doit être application/json'}), 400
-            
-        data = request.get_json()
-        logger.info(f"Tentative d'inscription: {data.get('email', 'no-email')}")
-        
-        # Validation
-        required_fields = ['nom', 'email', 'password', 'role']
-        for field in required_fields:
-            if field not in data:
-                logger.warning(f"Champ {field} manquant")
-                return jsonify({'message': f'Champ {field} manquant'}), 400
-        
-        # Empêcher la création d'autres admins
-        if data['role'] == 'admin':
-            return jsonify({'message': 'Création de compte admin non autorisée'}), 403
-        
-        # Vérifier si l'email existe déjà
-        response = supabase.from_('users').select('*').eq('email', data['email']).execute()
-        
-        if response.data and len(response.data) > 0:
-            return jsonify({'message': 'Email déjà utilisé'}), 409
-        
-        # Créer l'utilisateur
-        user_data = {
-            'nom': data['nom'],
-            'email': data['email'],
-            'password_hash': hash_password(data['password']),
-            'role': data['role']
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0'
+            }
         }
         
-        logger.info(f"Insertion utilisateur: {user_data['email']}")
-        result = supabase.from_('users').insert(user_data).execute()
+        # Proxy pour les sites difficiles
+        if 'tiktok' in url or 'instagram' in url:
+            proxy = get_proxy()
+            if proxy:
+                ydl_opts['proxy'] = proxy
         
-        if not result.data:
-            logger.error("Insertion retourne data vide")
-            return jsonify({'message': 'Erreur création utilisateur'}), 500
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
         
-        new_user = result.data[0]
-        logger.info(f"Utilisateur créé: {new_user['id']}")
+        device = detect_device(request.headers.get('User-Agent', ''))
         
-        # Générer le token
-        token = generate_token({
-            'id': new_user['id'],
-            'email': new_user['email'],
-            'role': new_user['role']
+        formats = []
+        seen = set()
+        
+        # Tri qualité
+        sorted_formats = sorted(
+            info.get('formats', []),
+            key=lambda x: x.get('height', 0) or 0,
+            reverse=True
+        )
+        
+        for f in sorted_formats:
+            if f.get('vcodec') != 'none' and f.get('height'):
+                h = f['height']
+                
+                if h <= device['max_height'] and h not in seen:
+                    if f.get('filesize'):
+                        size = round(f['filesize'] / (1024 * 1024), 1)
+                        size_mb = f"{size}MB"
+                    else:
+                        size_mb = "?"
+                    
+                    # Vérifier si le format est disponible en direct
+                    has_direct = 'url' in f
+                    
+                    formats.append({
+                        'label': f"{h}p",
+                        'format_id': f['format_id'],
+                        'size_mb': size_mb,
+                        'direct': has_direct
+                    })
+                    
+                    seen.add(h)
+        
+        # Audio
+        formats.append({
+            'label': 'Audio MP3',
+            'format_id': 'audio',
+            'size_mb': '~5-10MB',
+            'direct': True
         })
         
-        return jsonify({
-            'message': 'Compte créé avec succès',
-            'token': token,
-            'user': {
-                'id': new_user['id'],
-                'nom': new_user['nom'],
-                'email': new_user['email'],
-                'role': new_user['role']
-            }
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Erreur détaillée registration: {str(e)}", exc_info=True)
-        return jsonify({'message': 'Erreur interne du serveur', 'error': str(e)}), 500
-
-@app.route('/api/auth/login', methods=['POST'])
-def login():
-    """Connexion utilisateur"""
-    try:
-        if not request.is_json:
-            return jsonify({'message': 'Content-Type doit être application/json'}), 400
-            
-        data = request.get_json()
-        logger.info(f"Tentative connexion: {data.get('email', 'no-email')}")
-        
-        # Validation
-        if 'email' not in data or 'password' not in data:
-            return jsonify({'message': 'Email et mot de passe requis'}), 400
-        
-        # Récupérer l'utilisateur
-        result = supabase.from_('users').select('*').eq('email', data['email']).execute()
-        
-        if not result.data or len(result.data) == 0:
-            return jsonify({'message': 'Email ou mot de passe incorrect'}), 401
-        
-        user = result.data[0]
-        
-        # Vérifier le mot de passe
-        if not check_password(data['password'], user['password_hash']):
-            return jsonify({'message': 'Email ou mot de passe incorrect'}), 401
-        
-        # Générer le token
-        token = generate_token({
-            'id': user['id'],
-            'email': user['email'],
-            'role': user['role']
-        })
-        
-        return jsonify({
-            'message': 'Connexion réussie',
-            'token': token,
-            'user': {
-                'id': user['id'],
-                'nom': user['nom'],
-                'email': user['email'],
-                'role': user['role']
-            }
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Erreur login: {str(e)}", exc_info=True)
-        return jsonify({'message': 'Erreur interne du serveur'}), 500
-
-@app.route('/api/auth/logout', methods=['POST'])
-@token_required
-def logout():
-    """Déconnexion"""
-    return jsonify({'message': 'Déconnexion réussie'}), 200
-
-@app.route('/api/auth/me', methods=['GET'])
-@token_required
-def get_current_user():
-    """Récupérer les infos de l'utilisateur courant"""
-    try:
-        user_id = request.user['user_id']
-        result = supabase.from_('users').select('id, nom, email, role, created_at').eq('id', user_id).execute()
-        
-        if not result.data:
-            return jsonify({'message': 'Utilisateur non trouvé'}), 404
-        
-        return jsonify({'user': result.data[0]}), 200
-        
-    except Exception as e:
-        logger.error(f"Erreur get_current_user: {e}")
-        return jsonify({'message': 'Erreur interne du serveur'}), 500
-
-# =====================================================
-# ROUTES DE DIAGNOSTIC
-# =====================================================
-
-@app.route('/api/debug/test', methods=['GET'])
-def debug_test():
-    """Route de débogage pour tester Supabase"""
-    try:
-        # Test 1: Vérifier les variables d'environnement
-        env_status = {
-            'SUPABASE_URL': 'SET' if SUPABASE_URL else 'MISSING',
-            'SUPABASE_KEY': 'SET' if SUPABASE_KEY else 'MISSING',
-            'ADMIN_EMAIL': ADMIN_EMAIL
+        response = {
+            'title': info.get('title'),
+            'thumbnail': info.get('thumbnail'),
+            'duration': info.get('duration'),
+            'device': device['emoji'],
+            'plan': plan,
+            'formats': formats
         }
         
-        # Test 2: Tester la connexion Supabase
-        supabase_status = "UNKNOWN"
-        table_users_exists = False
-        table_patients_exists = False
+        # Cache pour 1 heure
+        redis_client.setex(cache_key, 3600, json.dumps(response))
         
+        return jsonify(response)
+        
+    except Exception as e:
+        logging.error(f"❌ INFO ERROR: {e}")
+        increment_stat('errors')
+        return jsonify({'error': 'Impossible de récupérer la vidéo'}), 500
+
+# ⬇️ DOWNLOAD (avec fallback)
+@app.route('/download', methods=['POST'])
+@require_api_key
+def download(plan):
+    data = request.get_json()
+    url = data.get('url')
+    format_id = data.get('format')
+    async_mode = data.get('async', False)  # Pour les gros fichiers
+    
+    increment_stat('downloads')
+    
+    if not url or not format_id:
+        increment_stat('errors')
+        return jsonify({'error': 'Paramètres manquants'}), 400
+    
+    if not any(site in url for site in ALLOWED_SITES):
+        increment_stat('errors')
+        return jsonify({'error': 'Site non supporté'}), 400
+    
+    try:
+        # Mode asynchrone pour les fichiers lourds
+        if async_mode:
+            task = download_task.delay(url, format_id)
+            return jsonify({
+                'task_id': task.id,
+                'status': 'processing',
+                'check_url': f"/task/{task.id}"
+            })
+        
+        # Mode synchrone (rapide)
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0'
+            }
+        }
+        
+        # Proxy pour TikTok/Instagram
+        if 'tiktok' in url or 'instagram' in url:
+            proxy = get_proxy()
+            if proxy:
+                ydl_opts['proxy'] = proxy
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        
+        direct_url = None
+        
+        if format_id == 'audio':
+            for f in info.get('formats', []):
+                if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
+                    direct_url = f.get('url')
+                    break
+        else:
+            for f in info.get('formats', []):
+                if f.get('format_id') == format_id:
+                    direct_url = f.get('url')
+                    break
+        
+        if not direct_url:
+            increment_stat('errors')
+            return jsonify({'error': 'Format introuvable'}), 404
+        
+        logging.info(f"📥 Download {plan} | {format_id} | {url[:40]}")
+        
+        # Fallback: si redirect échoue, renvoyer l'URL
         try:
-            # Tester users
-            response_users = supabase.from_('users').select('count', count='exact').limit(1).execute()
-            table_users_exists = True
-            logger.info(f"Test users réussi: {response_users}")
-            
-            # Tester patients
-            response_patients = supabase.from_('patients').select('count', count='exact').limit(1).execute()
-            table_patients_exists = True
-            logger.info(f"Test patients réussi: {response_patients}")
-            
-            supabase_status = "CONNECTED"
-            
-        except Exception as e:
-            supabase_status = f"ERROR: {str(e)}"
-        
-        return jsonify({
-            'timestamp': datetime.utcnow().isoformat(),
-            'environment': env_status,
-            'supabase': supabase_status,
-            'tables': {
-                'users': table_users_exists,
-                'patients': table_patients_exists
-            }
-        }), 200
+            return redirect(direct_url, 302)
+        except:
+            return jsonify({
+                'download_url': direct_url,
+                'expires_in': 3600,
+                'format': format_id
+            })
         
     except Exception as e:
-        logger.error(f"Erreur debug_test: {e}")
-        return jsonify({'error': str(e)}), 500
+        logging.error(f"❌ DOWNLOAD ERROR: {e}")
+        increment_stat('errors')
+        return jsonify({'error': 'Erreur téléchargement'}), 500
 
-@app.route('/api/debug/create-tables', methods=['POST'])
-def create_tables():
-    """Créer les tables manuellement (à exécuter une fois)"""
-    try:
-        # Cette route nécessite que vous ayez créé la fonction RPC dans Supabase
-        # Ou utilisez l'interface SQL de Supabase directement
-        return jsonify({
-            'message': 'Veuillez créer les tables manuellement dans Supabase SQL Editor',
-            'sql': """
-                -- Table users
-                CREATE TABLE IF NOT EXISTS users (
-                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-                    email VARCHAR(255) UNIQUE NOT NULL,
-                    nom VARCHAR(255) NOT NULL,
-                    password_hash VARCHAR(255) NOT NULL,
-                    role VARCHAR(50) NOT NULL CHECK (role IN ('accueil', 'docteur', 'medecin', 'pharmacie', 'facturation', 'admin')),
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-                );
-
-                -- Table patients
-                CREATE TABLE IF NOT EXISTS patients (
-                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
-                    nom_complet VARCHAR(255) NOT NULL,
-                    date_naissance DATE NOT NULL,
-                    telephone VARCHAR(50),
-                    email VARCHAR(255),
-                    adresse TEXT,
-                    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                    created_by UUID REFERENCES users(id)
-                );
-            """
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# =====================================================
-# ROUTES PATIENTS (simplifiées pour test)
-# =====================================================
-
-@app.route('/api/patients', methods=['GET'])
-@token_required
-def get_patients():
-    """Récupérer tous les patients"""
-    try:
-        result = supabase.from_('patients').select('*').order('created_at', desc=True).execute()
-        return jsonify({'patients': result.data}), 200
-    except Exception as e:
-        logger.error(f"Erreur get_patients: {e}")
-        return jsonify({'message': 'Erreur interne du serveur'}), 500
-
-@app.route('/api/patients', methods=['POST'])
-@token_required
-def create_patient():
-    """Créer un nouveau patient"""
-    try:
-        data = request.get_json()
-        
-        required_fields = ['nom_complet', 'date_naissance']
-        for field in required_fields:
-            if field not in data:
-                return jsonify({'message': f'Champ {field} manquant'}), 400
-        
-        patient_data = {
-            'nom_complet': data['nom_complet'],
-            'date_naissance': data['date_naissance'],
-            'telephone': data.get('telephone'),
-            'email': data.get('email'),
-            'adresse': data.get('adresse'),
-            'created_by': request.user['user_id']
+# 📊 STATS (admin uniquement)
+@app.route('/admin/stats')
+def admin_stats():
+    auth = request.authorization
+    if not auth or auth.username != os.getenv('ADMIN_USER', 'admin') or auth.password != os.getenv('ADMIN_PASS', 'admin'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    days = int(request.args.get('days', 7))
+    stats = get_stats(days)
+    
+    # Top formats
+    top_formats = {}
+    for i in range(days):
+        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
+        formats_key = f"stat:formats:{date}"
+        formats_data = redis_client.hgetall(formats_key)
+        for fmt, count in formats_data.items():
+            top_formats[fmt] = top_formats.get(fmt, 0) + int(count)
+    
+    top_formats = dict(sorted(top_formats.items(), key=lambda x: x[1], reverse=True)[:10])
+    
+    return jsonify({
+        'period': f"{days} days",
+        'daily': stats,
+        'total': {
+            'downloads': sum(d['downloads'] for d in stats.values()),
+            'info': sum(d['info'] for d in stats.values()),
+            'unique_ips': sum(d['unique_ips'] for d in stats.values())
+        },
+        'top_formats': top_formats,
+        'cache_size': redis_client.dbsize(),
+        'active_plans': {
+            'free': redis_client.scard('active:free') or 0,
+            'premium': redis_client.scard('active:premium') or 0,
+            'pro': redis_client.scard('active:pro') or 0
         }
-        
-        result = supabase.from_('patients').insert(patient_data).execute()
-        
-        if not result.data:
-            return jsonify({'message': 'Erreur création patient'}), 500
-        
-        return jsonify({
-            'message': 'Patient créé avec succès',
-            'patient': result.data[0]
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Erreur create_patient: {e}")
-        return jsonify({'message': 'Erreur interne du serveur'}), 500
+    })
 
-# =====================================================
-# ROUTES SANTÉ
-# =====================================================
+# 🔍 TASK STATUS (pour les downloads async)
+@app.route('/task/<task_id>')
+def task_status(task_id):
+    task = download_task.AsyncResult(task_id)
+    
+    if task.state == 'PENDING':
+        return jsonify({'status': 'pending'})
+    elif task.state == 'SUCCESS':
+        return jsonify({'status': 'success', 'result': task.result})
+    elif task.state == 'FAILURE':
+        return jsonify({'status': 'failed', 'error': str(task.info)})
+    else:
+        return jsonify({'status': task.state})
 
-@app.route('/api/health', methods=['GET'])
-def health_check():
-    """Vérifier la santé de l'API"""
-    try:
-        # Tester la connexion à Supabase
-        supabase.from_('users').select('count', count='exact').limit(1).execute()
-        
-        return jsonify({
-            'status': 'healthy',
-            'timestamp': datetime.utcnow().isoformat(),
-            'service': 'hospital-backend',
-            'version': '1.0.0'
-        }), 200
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 500
+# 💰 PLANS (pour la monétisation)
+@app.route('/plans')
+def get_plans():
+    return jsonify(API_KEYS)
 
-# =====================================================
-# CONFIGURATION ET DÉMARRAGE
-# =====================================================
+# ❤️ HEALTH
+@app.route('/')
+def health():
+    return jsonify({
+        'status': 'online',
+        'version': '3.0',
+        'cache': redis_client.dbsize(),
+        'mode': 'ULTIMATE',
+        'features': ['redis', 'celery', 'proxy', 'api_keys', 'stats']
+    })
 
 if __name__ == '__main__':
-    logger.info("=" * 50)
-    logger.info("Démarrage HospitalApp Backend")
-    logger.info(f"Supabase URL: {SUPABASE_URL}")
-    logger.info(f"Admin email: {ADMIN_EMAIL}")
-    logger.info("=" * 50)
-    
-    # Initialiser la base de données
-    if init_database():
-        logger.info("Backend HospitalApp démarré avec succès sur http://0.0.0.0:5000")
-        logger.info("Routes disponibles:")
-        logger.info("  GET  /api/health          - Vérifier santé API")
-        logger.info("  GET  /api/debug/test      - Tester connexion Supabase")
-        logger.info("  POST /api/auth/register   - S'inscrire")
-        logger.info("  POST /api/auth/login      - Se connecter")
-        logger.info("  GET  /api/auth/me         - Info utilisateur (token requis)")
-        app.run(host='0.0.0.0', port=5000, debug=True)
-    else:
-        logger.error("Échec de l'initialisation. Vérifiez la configuration.")
+    port = int(os.environ.get('PORT', 5000))
+    logging.basicConfig(level=logging.INFO)
+    logging.info("🚀 Backend ULTIME démarré")
+    app.run(host='0.0.0.0', port=port)
