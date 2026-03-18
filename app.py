@@ -1,51 +1,39 @@
 import os
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from functools import wraps
 from dotenv import load_dotenv
 
-from flask import Flask, request, jsonify, redirect, session
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 import yt_dlp
 from cachetools import TTLCache
 import user_agents
-import redis
-from celery import Celery
 import json
+import secrets
 
 # Charger les variables d'environnement
 load_dotenv()
 
 app = Flask(__name__)
-app.secret_key = os.getenv('SECRET_KEY', 'dev-key-change-en-prod')
+app.secret_key = os.getenv('SECRET_KEY', secrets.token_hex(32))
 
-# 🔐 Configuration Redis
-redis_client = redis.Redis.from_url(
-    os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
-    decode_responses=True
-)
-
-# ⚡ Configuration Celery
-celery = Celery(
-    app.name,
-    broker=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
-    backend=os.getenv('REDIS_URL', 'redis://localhost:6379/0')
-)
-
-# 🔐 CORS ultra sécurisé
+# 🔐 CORS
 ALLOWED_ORIGINS = [
     'https://tikt0k-64.web.app',
-    'http://localhost:3000'  # pour le dev
+    'http://localhost:3000'
 ]
 CORS(app, origins=ALLOWED_ORIGINS)
 
-# 📊 Rate limiting avec Redis
+# ⚡ Cache
+video_cache = TTLCache(maxsize=100, ttl=3600)
+
+# 🚫 Rate limit
 limiter = Limiter(
     app,
     key_func=get_remote_address,
-    storage_uri=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
     default_limits=["30 per minute"]
 )
 
@@ -58,80 +46,120 @@ ALLOWED_SITES = [
     'twitter.com', 'x.com'
 ]
 
-# 🔑 API Keys (pour monétisation)
+# ========== API KEYS ==========
+# Stockage des API keys (en mémoire, mais tu peux mettre dans .env)
 API_KEYS = {
-    'free': {'rate': '10 per minute', 'price': 0},
-    'premium': {'rate': '100 per minute', 'price': 9.99},
-    'pro': {'rate': 'unlimited', 'price': 29.99}
-}
-VALID_API_KEYS = {
-    'free_123': 'free',
-    'premium_456': 'premium',
-    'pro_789': 'pro'
+    # Format: 'api_key': {'plan': 'free/premium/pro', 'uses': 0, 'max_uses': 100}
 }
 
-# 📈 Statistiques
-def increment_stat(stat_name):
-    """Incrémente un compteur Redis"""
-    today = datetime.now().strftime('%Y-%m-%d')
-    redis_client.incr(f"stat:{stat_name}:{today}")
-    redis_client.expire(f"stat:{stat_name}:{today}", 86400 * 30)  # 30 jours
+# Charger les API keys depuis .env
+def load_api_keys():
+    """Charge les API keys depuis les variables d'environnement"""
+    keys_str = os.getenv('API_KEYS', '')
+    if keys_str:
+        for key_info in keys_str.split(','):
+            parts = key_info.split(':')
+            if len(parts) == 2:
+                api_key, plan = parts
+                API_KEYS[api_key] = {
+                    'plan': plan,
+                    'uses': 0,
+                    'max_uses': 1000 if plan == 'free' else 10000 if plan == 'premium' else 999999,
+                    'created': datetime.now().isoformat()
+                }
+    
+    # API key par défaut pour test
+    API_KEYS['test_key_123'] = {
+        'plan': 'free',
+        'uses': 0,
+        'max_uses': 100,
+        'created': datetime.now().isoformat()
+    }
 
-def get_stats(days=7):
-    """Récupère les stats des derniers jours"""
-    stats = {}
-    for i in range(days):
-        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
-        stats[date] = {
-            'downloads': int(redis_client.get(f"stat:downloads:{date}") or 0),
-            'info': int(redis_client.get(f"stat:info:{date}") or 0),
-            'errors': int(redis_client.get(f"stat:errors:{date}") or 0),
-            'unique_ips': redis_client.scard(f"stat:ips:{date}") or 0
-        }
-    return stats
+load_api_keys()
 
-# 🔐 Middleware API Key
+# Middleware pour vérifier l'API key
 def require_api_key(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        # Récupérer l'API key depuis l'en-tête
         api_key = request.headers.get('X-API-Key')
         
+        # Ou depuis les paramètres GET (pour tests)
         if not api_key:
-            return jsonify({'error': 'API key required'}), 401
+            api_key = request.args.get('api_key')
         
-        if api_key not in VALID_API_KEYS:
+        if not api_key:
+            return jsonify({
+                'error': 'API key required',
+                'message': 'Ajoutez X-API-Key dans les headers'
+            }), 401
+        
+        # Vérifier si la clé existe
+        if api_key not in API_KEYS:
             return jsonify({'error': 'Invalid API key'}), 401
         
-        plan = VALID_API_KEYS[api_key]
-        kwargs['plan'] = plan
+        key_info = API_KEYS[api_key]
         
-        # Rate limit personnalisé
-        if plan != 'pro':
-            limiter.limit(API_KEYS[plan]['rate'])(f)
+        # Vérifier le nombre d'utilisations
+        if key_info['uses'] >= key_info['max_uses']:
+            return jsonify({'error': 'API key limit exceeded'}), 429
+        
+        # Incrémenter le compteur
+        key_info['uses'] += 1
+        
+        # Ajouter les infos à kwargs
+        kwargs['api_key_info'] = key_info
+        kwargs['plan'] = key_info['plan']
         
         return f(*args, **kwargs)
     return decorated
 
-# 🔄 Proxy rotation (pour éviter les blocages)
-PROXIES = [
-    'http://proxy1:port',
-    'http://proxy2:port',
-    # À configurer avec un service comme ProxyCrawl ou ScraperAPI
-]
+# Route pour générer une nouvelle API key (admin seulement)
+@app.route('/admin/generate-key', methods=['POST'])
+def generate_api_key():
+    # Auth simple (à améliorer)
+    auth = request.authorization
+    if not auth or auth.username != os.getenv('ADMIN_USER', 'admin') or auth.password != os.getenv('ADMIN_PASS', 'admin'):
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json() or {}
+    plan = data.get('plan', 'free')
+    
+    if plan not in ['free', 'premium', 'pro']:
+        return jsonify({'error': 'Plan must be free, premium, or pro'}), 400
+    
+    # Générer une clé aléatoire
+    new_key = f"{plan}_{secrets.token_hex(8)}"
+    
+    API_KEYS[new_key] = {
+        'plan': plan,
+        'uses': 0,
+        'max_uses': 1000 if plan == 'free' else 10000 if plan == 'premium' else 999999,
+        'created': datetime.now().isoformat()
+    }
+    
+    return jsonify({
+        'api_key': new_key,
+        'plan': plan,
+        'max_uses': API_KEYS[new_key]['max_uses']
+    })
 
-def get_proxy():
-    """Retourne un proxy aléatoire"""
-    if PROXIES:
-        import random
-        return random.choice(PROXIES)
-    return None
+# Route pour voir ses infos (avec sa clé)
+@app.route('/key-info', methods=['GET'])
+@require_api_key
+def key_info(api_key_info, plan):
+    return jsonify({
+        'plan': plan,
+        'uses': api_key_info['uses'],
+        'remaining': api_key_info['max_uses'] - api_key_info['uses'],
+        'max_uses': api_key_info['max_uses'],
+        'created': api_key_info['created']
+    })
 
 # 📱 Détection device
 def detect_device(user_agent_string):
     ua = user_agents.parse(user_agent_string)
-    
-    # Enregistrer l'IP unique pour les stats
-    redis_client.sadd(f"stat:ips:{datetime.now().strftime('%Y-%m-%d')}", request.remote_addr)
     
     if ua.is_mobile:
         return {'type': 'mobile', 'max_height': 480, 'emoji': '📱'}
@@ -140,87 +168,38 @@ def detect_device(user_agent_string):
     else:
         return {'type': 'desktop', 'max_height': 1080, 'emoji': '💻'}
 
-# 🎯 Tâche Celery pour téléchargement asynchrone
-@celery.task(bind=True, max_retries=3)
-def download_task(self, url, format_id):
-    """Téléchargement en arrière-plan"""
-    try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': format_id if format_id != 'audio' else 'bestaudio',
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-        }
-        
-        if format_id == 'audio':
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-            }]
-        
-        # Ajouter un proxy si disponible
-        proxy = get_proxy()
-        if proxy:
-            ydl_opts['proxy'] = proxy
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            
-            # Trouver l'URL directe
-            if format_id == 'audio':
-                for f in info['formats']:
-                    if f.get('acodec') != 'none' and f.get('vcodec') == 'none':
-                        return {'url': f['url'], 'format': 'audio'}
-            else:
-                for f in info['formats']:
-                    if f.get('format_id') == format_id:
-                        return {'url': f['url'], 'format': 'video'}
-        
-        return {'error': 'Format not found'}
-        
-    except Exception as e:
-        self.retry(exc=e, countdown=60)  # Réessayer après 60s
-
-# 📥 INFO (avec cache Redis)
+# 📥 INFO (protégé par API key)
 @app.route('/info', methods=['POST'])
 @limiter.limit("30 per minute")
 @require_api_key
-def get_info(plan):
+def get_info(api_key_info, plan):
     data = request.get_json()
     url = data.get('url')
-    
-    increment_stat('info')
     
     if not url:
         return jsonify({'error': 'URL manquante'}), 400
     
     # 🔐 Sécurité URL
     if not any(site in url for site in ALLOWED_SITES):
-        increment_stat('errors')
         return jsonify({'error': 'Site non supporté'}), 400
     
-    # Cache Redis
+    # Vérifier le cache
     cache_key = f"info:{url}"
-    cached = redis_client.get(cache_key)
-    if cached:
-        return jsonify(json.loads(cached))
+    if cache_key in video_cache:
+        response = video_cache[cache_key]
+        response['plan'] = plan
+        response['remaining'] = api_key_info['max_uses'] - api_key_info['uses']
+        return jsonify(response)
     
     try:
+        # Options yt-dlp
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'http_headers': {
-                'User-Agent': 'Mozilla/5.0'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
         }
-        
-        # Proxy pour les sites difficiles
-        if 'tiktok' in url or 'instagram' in url:
-            proxy = get_proxy()
-            if proxy:
-                ydl_opts['proxy'] = proxy
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -230,7 +209,7 @@ def get_info(plan):
         formats = []
         seen = set()
         
-        # Tri qualité
+        # Trier par qualité
         sorted_formats = sorted(
             info.get('formats', []),
             key=lambda x: x.get('height', 0) or 0,
@@ -248,14 +227,10 @@ def get_info(plan):
                     else:
                         size_mb = "?"
                     
-                    # Vérifier si le format est disponible en direct
-                    has_direct = 'url' in f
-                    
                     formats.append({
                         'label': f"{h}p",
                         'format_id': f['format_id'],
-                        'size_mb': size_mb,
-                        'direct': has_direct
+                        'size_mb': size_mb
                     })
                     
                     seen.add(h)
@@ -264,59 +239,45 @@ def get_info(plan):
         formats.append({
             'label': 'Audio MP3',
             'format_id': 'audio',
-            'size_mb': '~5-10MB',
-            'direct': True
+            'size_mb': '~5-10MB'
         })
         
         response = {
-            'title': info.get('title'),
+            'title': info.get('title', 'Sans titre'),
             'thumbnail': info.get('thumbnail'),
             'duration': info.get('duration'),
             'device': device['emoji'],
             'plan': plan,
+            'remaining': api_key_info['max_uses'] - api_key_info['uses'],
             'formats': formats
         }
         
-        # Cache pour 1 heure
-        redis_client.setex(cache_key, 3600, json.dumps(response))
+        # Mettre en cache
+        video_cache[cache_key] = response
         
         return jsonify(response)
         
     except Exception as e:
         logging.error(f"❌ INFO ERROR: {e}")
-        increment_stat('errors')
         return jsonify({'error': 'Impossible de récupérer la vidéo'}), 500
 
-# ⬇️ DOWNLOAD (avec fallback)
+# ⬇️ DOWNLOAD (protégé par API key)
 @app.route('/download', methods=['POST'])
+@limiter.limit("10 per minute")
 @require_api_key
-def download(plan):
+def download(api_key_info, plan):
     data = request.get_json()
     url = data.get('url')
     format_id = data.get('format')
-    async_mode = data.get('async', False)  # Pour les gros fichiers
-    
-    increment_stat('downloads')
     
     if not url or not format_id:
-        increment_stat('errors')
         return jsonify({'error': 'Paramètres manquants'}), 400
     
     if not any(site in url for site in ALLOWED_SITES):
-        increment_stat('errors')
         return jsonify({'error': 'Site non supporté'}), 400
     
     try:
-        # Mode asynchrone pour les fichiers lourds
-        if async_mode:
-            task = download_task.delay(url, format_id)
-            return jsonify({
-                'task_id': task.id,
-                'status': 'processing',
-                'check_url': f"/task/{task.id}"
-            })
-        
-        # Mode synchrone (rapide)
+        # Options yt-dlp
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
@@ -324,12 +285,6 @@ def download(plan):
                 'User-Agent': 'Mozilla/5.0'
             }
         }
-        
-        # Proxy pour TikTok/Instagram
-        if 'tiktok' in url or 'instagram' in url:
-            proxy = get_proxy()
-            if proxy:
-                ydl_opts['proxy'] = proxy
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -348,82 +303,20 @@ def download(plan):
                     break
         
         if not direct_url:
-            increment_stat('errors')
             return jsonify({'error': 'Format introuvable'}), 404
         
-        logging.info(f"📥 Download {plan} | {format_id} | {url[:40]}")
+        logging.info(f"📥 Download {plan} | {format_id} | {url[:40]}...")
         
-        # Fallback: si redirect échoue, renvoyer l'URL
-        try:
-            return redirect(direct_url, 302)
-        except:
-            return jsonify({
-                'download_url': direct_url,
-                'expires_in': 3600,
-                'format': format_id
-            })
+        # Ajouter les infos d'utilisation dans l'en-tête
+        response = redirect(direct_url, 302)
+        response.headers['X-Remaining'] = str(api_key_info['max_uses'] - api_key_info['uses'])
+        response.headers['X-Plan'] = plan
+        
+        return response
         
     except Exception as e:
         logging.error(f"❌ DOWNLOAD ERROR: {e}")
-        increment_stat('errors')
         return jsonify({'error': 'Erreur téléchargement'}), 500
-
-# 📊 STATS (admin uniquement)
-@app.route('/admin/stats')
-def admin_stats():
-    auth = request.authorization
-    if not auth or auth.username != os.getenv('ADMIN_USER', 'admin') or auth.password != os.getenv('ADMIN_PASS', 'admin'):
-        return jsonify({'error': 'Unauthorized'}), 401
-    
-    days = int(request.args.get('days', 7))
-    stats = get_stats(days)
-    
-    # Top formats
-    top_formats = {}
-    for i in range(days):
-        date = (datetime.now() - timedelta(days=i)).strftime('%Y-%m-%d')
-        formats_key = f"stat:formats:{date}"
-        formats_data = redis_client.hgetall(formats_key)
-        for fmt, count in formats_data.items():
-            top_formats[fmt] = top_formats.get(fmt, 0) + int(count)
-    
-    top_formats = dict(sorted(top_formats.items(), key=lambda x: x[1], reverse=True)[:10])
-    
-    return jsonify({
-        'period': f"{days} days",
-        'daily': stats,
-        'total': {
-            'downloads': sum(d['downloads'] for d in stats.values()),
-            'info': sum(d['info'] for d in stats.values()),
-            'unique_ips': sum(d['unique_ips'] for d in stats.values())
-        },
-        'top_formats': top_formats,
-        'cache_size': redis_client.dbsize(),
-        'active_plans': {
-            'free': redis_client.scard('active:free') or 0,
-            'premium': redis_client.scard('active:premium') or 0,
-            'pro': redis_client.scard('active:pro') or 0
-        }
-    })
-
-# 🔍 TASK STATUS (pour les downloads async)
-@app.route('/task/<task_id>')
-def task_status(task_id):
-    task = download_task.AsyncResult(task_id)
-    
-    if task.state == 'PENDING':
-        return jsonify({'status': 'pending'})
-    elif task.state == 'SUCCESS':
-        return jsonify({'status': 'success', 'result': task.result})
-    elif task.state == 'FAILURE':
-        return jsonify({'status': 'failed', 'error': str(task.info)})
-    else:
-        return jsonify({'status': task.state})
-
-# 💰 PLANS (pour la monétisation)
-@app.route('/plans')
-def get_plans():
-    return jsonify(API_KEYS)
 
 # ❤️ HEALTH
 @app.route('/')
@@ -431,13 +324,18 @@ def health():
     return jsonify({
         'status': 'online',
         'version': '3.0',
-        'cache': redis_client.dbsize(),
-        'mode': 'ULTIMATE',
-        'features': ['redis', 'celery', 'proxy', 'api_keys', 'stats']
+        'cache_size': len(video_cache),
+        'mode': 'with API keys',
+        'endpoints': {
+            'info': '/info (POST)',
+            'download': '/download (POST)',
+            'generate_key': '/admin/generate-key (POST)',
+            'key_info': '/key-info (GET)'
+        }
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logging.basicConfig(level=logging.INFO)
-    logging.info("🚀 Backend ULTIME démarré")
+    logging.info(f"🚀 Backend avec API keys démarré sur port {port}")
     app.run(host='0.0.0.0', port=port)
